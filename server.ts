@@ -264,19 +264,25 @@ async function sendDirectReplyEmail(
   to: string,
   originalSubject: string,
   replyBody: string,
-  inReplyTo?: string
+  inReplyTo?: string,
+  references?: string[]
 ): Promise<void> {
   const transporter = createSmtpTransport(config);
   const subject = /^re:/i.test(originalSubject)
     ? originalSubject
     : `Re: ${originalSubject}`;
 
+  const refChain =
+    references && references.length > 0
+      ? Array.from(new Set([...references, ...(inReplyTo ? [inReplyTo] : [])])).join(' ')
+      : inReplyTo;
+
   await transporter.sendMail({
     from: `"${config.senderName || 'Tom - Seb AI Support'}" <${config.gmailEmail.trim()}>`,
     to,
     subject,
     text: replyBody,
-    ...(inReplyTo ? { inReplyTo, references: inReplyTo } : {}),
+    ...(inReplyTo ? { inReplyTo, references: refChain } : {}),
   });
 }
 
@@ -296,6 +302,77 @@ async function sendEscalationEmail(
     subject: `[Seb AI Escalation] ${ticket.subject}`,
     text,
   });
+}
+
+async function fetchSentHistory(
+  client: ImapFlow,
+  config: SupportConfig
+): Promise<{
+  sentInReplyToIds: Set<string>;
+  latestSentAtByThread: Map<string, number>;
+}> {
+  const sentInReplyToIds = new Set<string>();
+  const latestSentAtByThread = new Map<string, number>();
+
+  try {
+    let sentPath = '[Gmail]/Sent Mail';
+    try {
+      const boxes = await client.list();
+      const sentBox = boxes.find(
+        (b) => b.specialUse === '\\Sent' || b.path.toLowerCase().includes('sent')
+      );
+      if (sentBox?.path) sentPath = sentBox.path;
+    } catch {
+      // fallback to [Gmail]/Sent Mail
+    }
+
+    const sentLock = await client.getMailboxLock(sentPath);
+    try {
+      const totalSent =
+        client.mailbox && typeof client.mailbox === 'object'
+          ? client.mailbox.exists
+          : 0;
+      if (totalSent > 0) {
+        const startSent = Math.max(1, totalSent - 49);
+        const escalationAddr = config.escalationEmail.trim().toLowerCase();
+        for await (const msg of client.fetch(`${startSent}:${totalSent}`, { envelope: true })) {
+          const inReplyTo = (msg.envelope?.inReplyTo || '').trim();
+          if (inReplyTo) {
+            sentInReplyToIds.add(inReplyTo);
+          }
+
+          const sentSubject = msg.envelope?.subject || '';
+          // Skip internal escalation notices when tracking customer thread reply timestamps
+          if (sentSubject.startsWith('[Seb AI Escalation]')) {
+            continue;
+          }
+
+          const sentDateMs = msg.envelope?.date
+            ? new Date(msg.envelope.date).getTime()
+            : 0;
+          const recipients = Array.isArray(msg.envelope?.to) ? msg.envelope.to : [];
+          for (const recipient of recipients) {
+            const addr = (recipient?.address || '').trim().toLowerCase();
+            if (!addr || addr === escalationAddr) continue;
+            const tKey = getThreadKey(addr, sentSubject);
+            const prev = latestSentAtByThread.get(tKey) ?? 0;
+            if (sentDateMs > prev) {
+              latestSentAtByThread.set(tKey, sentDateMs);
+            }
+          }
+        }
+      }
+    } finally {
+      sentLock.release();
+    }
+  } catch (err) {
+    console.warn(
+      '[Sent Mail Check] Could not read Sent Mail folder:',
+      err instanceof Error ? err.message : err
+    );
+  }
+
+  return { sentInReplyToIds, latestSentAtByThread };
 }
 
 async function runGmailScan(): Promise<{
@@ -328,6 +405,18 @@ async function runGmailScan(): Promise<{
 
   try {
     await client.connect();
+
+    // Sync Sent Mail across all instances/restarts so Tom never replies twice to the same message or stale thread
+    const { sentInReplyToIds, latestSentAtByThread } = await fetchSentHistory(client, config);
+    for (const id of sentInReplyToIds) {
+      if (!store.repliedMessageIds.includes(id)) {
+        store.repliedMessageIds.push(id);
+      }
+      if (!store.processedMessageIds.includes(id)) {
+        store.processedMessageIds.push(id);
+      }
+    }
+
     const lock = await client.getMailboxLock('INBOX');
 
     try {
@@ -377,8 +466,23 @@ async function runGmailScan(): Promise<{
         const envelopeSubject = item.envelope?.subject || '';
         const threadKey = getThreadKey(senderAddress, envelopeSubject);
 
-        // 1. Check if we already sent a reply to this message: if already replied, LEAVE IT
+        // 0. If IMAP already marked this message as \Answered, NEVER reply again
+        if (item.flags.has('\\Answered')) {
+          processedLookup.add(envelopeKey);
+          repliedLookup.add(envelopeKey);
+          if (!store.processedMessageIds.includes(envelopeKey)) {
+            store.processedMessageIds.push(envelopeKey);
+          }
+          if (!store.repliedMessageIds.includes(envelopeKey)) {
+            store.repliedMessageIds.push(envelopeKey);
+          }
+          continue;
+        }
+
+        // 1. Check if we already sent a reply to this message (local store OR Gmail Sent Mail)
         const alreadyReplied =
+          sentInReplyToIds.has(envelopeKey) ||
+          (rawEnvelopeId && sentInReplyToIds.has(rawEnvelopeId)) ||
           repliedLookup.has(envelopeKey) ||
           (rawEnvelopeId && repliedLookup.has(rawEnvelopeId)) ||
           store.tickets.some(
@@ -397,7 +501,6 @@ async function runGmailScan(): Promise<{
 
         // 2. Check if a newer message in this exact thread was already replied to in this scan batch
         if (handledThreadsInBatch.has(threadKey)) {
-          // Leave older messages in the same thread alone to avoid multiple replies
           processedLookup.add(envelopeKey);
           if (!store.processedMessageIds.includes(envelopeKey)) {
             store.processedMessageIds.push(envelopeKey);
@@ -405,8 +508,21 @@ async function runGmailScan(): Promise<{
           continue;
         }
 
-        // 3. Check if an earlier scan already replied to a newer message in this thread
+        // 3. Check if Sent Mail OR an earlier scan already replied to this thread AFTER/AT this message's date
         const itemDateMs = item.envelope?.date ? new Date(item.envelope.date).getTime() : 0;
+        const latestSentInGmail = latestSentAtByThread.get(threadKey) ?? 0;
+        if (latestSentInGmail > 0 && latestSentInGmail >= itemDateMs) {
+          processedLookup.add(envelopeKey);
+          repliedLookup.add(envelopeKey);
+          if (!store.processedMessageIds.includes(envelopeKey)) {
+            store.processedMessageIds.push(envelopeKey);
+          }
+          if (!store.repliedMessageIds.includes(envelopeKey)) {
+            store.repliedMessageIds.push(envelopeKey);
+          }
+          continue;
+        }
+
         const hasNewerSentReplyInThread = store.tickets.some((t) => {
           if (!t.emailSent) return false;
           if (getThreadKey(t.from, t.subject) !== threadKey) return false;
@@ -548,14 +664,35 @@ async function runGmailScan(): Promise<{
         let emailSent = false;
         let emailError: string | undefined;
 
+        const parsedRefs = Array.isArray(parsed.references)
+          ? parsed.references.map((r) => String(r).trim()).filter(Boolean)
+          : typeof parsed.references === 'string'
+            ? parsed.references.split(/\s+/).filter(Boolean)
+            : [];
+
         if (output.classification === 'REPLY' && output.replyBody) {
+          // Atomic IMAP claim check right before sending to prevent multi-instance duplicate sends
+          const freshCheck = await client.fetchOne(item.seq, { flags: true }).catch(() => null);
+          if (freshCheck?.flags?.has('\\Answered')) {
+            repliedLookup.add(finalMessageId);
+            handledThreadsInBatch.add(threadKey);
+            continue;
+          }
+
+          try {
+            await client.messageFlagsAdd(item.seq, ['\\Seen', '\\Answered']);
+          } catch {
+            // continue even if flag write is rejected
+          }
+
           try {
             await sendDirectReplyEmail(
               config,
               fromEmail,
               subject,
               output.replyBody,
-              finalMessageId
+              finalMessageId,
+              parsedRefs
             );
             emailSent = true;
             repliedLookup.add(finalMessageId);
@@ -564,6 +701,11 @@ async function runGmailScan(): Promise<{
             }
             handledThreadsInBatch.add(threadKey);
           } catch (err) {
+            try {
+              await client.messageFlagsRemove(item.seq, ['\\Answered']);
+            } catch {
+              // ignore rollback failure
+            }
             emailError = err instanceof Error ? err.message : String(err);
             console.error('[Send Reply Error]', emailError);
           }
@@ -571,14 +713,29 @@ async function runGmailScan(): Promise<{
           output.classification === 'ESCALATE' &&
           output.escalationBullets?.length
         ) {
+          // Atomic IMAP claim check right before sending to prevent multi-instance duplicate sends
+          const freshCheck = await client.fetchOne(item.seq, { flags: true }).catch(() => null);
+          if (freshCheck?.flags?.has('\\Answered')) {
+            repliedLookup.add(finalMessageId);
+            handledThreadsInBatch.add(threadKey);
+            continue;
+          }
+
           try {
-            // Send 3-bullet escalation notice to Yenil
+            await client.messageFlagsAdd(item.seq, ['\\Seen', '\\Answered']);
+          } catch {
+            // continue
+          }
+
+          try {
+            // Send 3-bullet escalation notice to internal escalation email
             await sendEscalationEmail(
               config,
               { from: fromEmail, subject, body, receivedAt },
               output.escalationBullets
             );
             emailSent = true;
+            handledThreadsInBatch.add(threadKey);
           } catch (err) {
             emailError = err instanceof Error ? err.message : String(err);
             console.error('[Send Escalation Error]', emailError);
@@ -592,7 +749,8 @@ async function runGmailScan(): Promise<{
                 fromEmail,
                 subject,
                 output.replyBody,
-                finalMessageId
+                finalMessageId,
+                parsedRefs
               );
               emailSent = true;
               repliedLookup.add(finalMessageId);
@@ -606,12 +764,12 @@ async function runGmailScan(): Promise<{
               console.error('[Send Escalation Customer Reply Error]', replyErr);
             }
           }
-        }
-
-        try {
-          await client.messageFlagsAdd(item.seq, ['\\Seen']);
-        } catch {
-          // ignore flag write error
+        } else {
+          try {
+            await client.messageFlagsAdd(item.seq, ['\\Seen']);
+          } catch {
+            // ignore flag write error
+          }
         }
 
         const ticket: SupportTicket = {
@@ -916,16 +1074,6 @@ async function startServer(): Promise<void> {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Seb AI Support Desk listening on http://0.0.0.0:${PORT}`);
-    if (
-      normalizeAppPassword(store.config.gmailAppPassword).length > 0 &&
-      store.config.apiKey.trim().length > 0
-    ) {
-      setTimeout(() => {
-        runGmailScan().catch((err) => {
-          console.error('[Startup Scan] Scan failed:', err instanceof Error ? err.message : err);
-        });
-      }, 3000);
-    }
   });
 }
 

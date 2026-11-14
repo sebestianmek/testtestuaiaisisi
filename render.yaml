@@ -1,26 +1,14 @@
-{
-  "services": [
-    {
-      "type": "web",
-      "name": "seb-ai-support-desk",
-      "env": "node",
-      "plan": "free",
-      "buildCommand": "npm install --legacy-peer-deps && npm run build",
-      "startCommand": "npm start",
-      "envVars": [
-        {
-          "key": "NODE_VERSION",
-          "value": "20.12.0"
-        },
-        {
-          "key": "GMAIL_APP_PASSWORD",
-          "sync": false
-        },
-        {
-          "key": "SEB_AI_API_KEY",
-          "sync": false
-        }
-      ]
-    }
-  ]
-}
+services:
+  - type: web
+    name: seb-ai-support-desk
+    runtime: node
+    plan: free
+    buildCommand: npm install --legacy-peer-deps && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.0
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: SEB_AI_API_KEY
+        sync: false
