@@ -1,0 +1,8 @@
+{
+  "name": "Seb AI Support Desk — Tom",
+  "description": "Dark-mode customer support AI dashboard for Seb AI powered by Tom - Seb AI Support, featuring automated Gmail triage, Seb AI model inference, escalation routing, and a live test simulator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
